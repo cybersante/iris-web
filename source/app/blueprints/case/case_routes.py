@@ -38,13 +38,14 @@ from app import app
 from app import db
 from app import socket_io
 from app.blueprints.case.case_assets_routes import case_assets_blueprint
+from app.blueprints.case.case_qualif_routes import case_qualif_blueprint
 from app.blueprints.case.case_graphs_routes import case_graph_blueprint
 from app.blueprints.case.case_ioc_routes import case_ioc_blueprint
 from app.blueprints.case.case_notes_routes import case_notes_blueprint
 from app.blueprints.case.case_rfiles_routes import case_rfiles_blueprint
 from app.blueprints.case.case_tasks_routes import case_tasks_blueprint
 from app.blueprints.case.case_timeline_routes import case_timeline_blueprint
-from app.datamgmt.case.case_db import case_exists, get_review_id_from_name
+from app.datamgmt.case.case_db import case_exists
 from app.datamgmt.case.case_db import case_get_desc_crc
 from app.datamgmt.case.case_db import get_activities_report_template
 from app.datamgmt.case.case_db import get_case
@@ -58,17 +59,16 @@ from app.datamgmt.manage.manage_users_db import get_users_list_restricted_from_c
 from app.datamgmt.manage.manage_users_db import set_user_case_access
 from app.datamgmt.reporter.report_db import export_case_json
 from app.forms import PipelinesCaseForm
-from app.iris_engine.access_control.utils import ac_get_all_access_level, ac_fast_check_current_user_has_case_access, \
-    ac_fast_check_user_has_case_access
+from app.iris_engine.access_control.utils import ac_get_all_access_level
 from app.iris_engine.access_control.utils import ac_set_case_access_for_users
 from app.iris_engine.module_handler.module_handler import list_available_pipelines
 from app.iris_engine.utils.tracker import track_activity
-from app.models import CaseStatus, ReviewStatusList
+from app.models import CaseStatus
 from app.models import UserActivity
 from app.models.authorization import CaseAccessLevel
 from app.models.authorization import User
-from app.schema.marshables import TaskLogSchema, CaseSchema
-from app.util import ac_api_case_requires, add_obj_history_entry
+from app.schema.marshables import TaskLogSchema
+from app.util import ac_api_case_requires
 from app.util import ac_case_requires
 from app.util import ac_socket_requires
 from app.util import response_error
@@ -77,6 +77,7 @@ from app.util import response_success
 app.register_blueprint(case_timeline_blueprint)
 app.register_blueprint(case_notes_blueprint)
 app.register_blueprint(case_assets_blueprint)
+app.register_blueprint(case_qualif_blueprint)
 app.register_blueprint(case_ioc_blueprint)
 app.register_blueprint(case_rfiles_blueprint)
 app.register_blueprint(case_graph_blueprint)
@@ -113,10 +114,9 @@ def case_r(caseid, url_redir):
     if not case:
         return render_template('select_case.html')
 
-    desc_crc32, description = case_get_desc_crc(caseid)
-    setattr(case, 'status_name', CaseStatus(case.status_id).name.replace('_', ' ').title())
+    desc_crc32, desc = case_get_desc_crc(caseid)
 
-    return render_template('case.html', case=case, desc=description, crc=desc_crc32,
+    return render_template('case_qualif.html', case=case, desc=desc, crc=desc_crc32,
                            reports=reports, reports_act=reports_act, form=form)
 
 
@@ -155,6 +155,8 @@ def case_pipelines_modal(caseid, url_redir):
 @socket_io.on('change')
 @ac_socket_requires(CaseAccessLevel.full_access)
 def socket_summary_onchange(data):
+    if not current_user.is_authenticated:
+        return
 
     data['last_change'] = current_user.user
     emit('change', data, to=data['channel'], skip_sid=request.sid)
@@ -163,6 +165,8 @@ def socket_summary_onchange(data):
 @socket_io.on('save')
 @ac_socket_requires(CaseAccessLevel.full_access)
 def socket_summary_onsave(data):
+    if not current_user.is_authenticated:
+        return
 
     data['last_saved'] = current_user.user
     emit('save', data, to=data['channel'], skip_sid=request.sid)
@@ -171,6 +175,8 @@ def socket_summary_onsave(data):
 @socket_io.on('clear_buffer')
 @ac_socket_requires(CaseAccessLevel.full_access)
 def socket_summary_onchange(message):
+    if not current_user.is_authenticated:
+        return
 
     emit('clear_buffer', message)
 
@@ -178,6 +184,8 @@ def socket_summary_onchange(message):
 @socket_io.on('join')
 @ac_socket_requires(CaseAccessLevel.full_access)
 def get_message(data):
+    if not current_user.is_authenticated:
+        return
 
     room = data['channel']
     join_room(room=room)
@@ -212,9 +220,9 @@ def desc_fetch(caseid):
 @case_blueprint.route('/case/summary/fetch', methods=['GET'])
 @ac_api_case_requires(CaseAccessLevel.read_only, CaseAccessLevel.full_access)
 def summary_fetch(caseid):
-    desc_crc32, description = case_get_desc_crc(caseid)
+    desc_crc32, desc = case_get_desc_crc(caseid)
 
-    return response_success("Summary fetch", data={'case_description': description, 'crc32': desc_crc32})
+    return response_success("Summary fetch", data={'case_description': desc, 'crc32': desc_crc32})
 
 
 @case_blueprint.route('/case/activities/list', methods=['GET'])
@@ -253,9 +261,9 @@ def case_add_tasklog(caseid):
 
     try:
 
-        log_data = log_schema.load(request.get_json())
+        log = log_schema.load(request.get_json())
 
-        ua = track_activity(log_data.get('log_content'), caseid, user_input=True)
+        ua = track_activity(log.get('log_content'), caseid, user_input=True)
 
     except marshmallow.exceptions.ValidationError as e:
         return response_error(msg="Data error", data=e.messages, status=400)
@@ -295,10 +303,6 @@ def group_cac_set_case(caseid):
     if data.get('case_id') != caseid:
         return response_error("Inconsistent case ID")
 
-    case = get_case(caseid)
-    if not case:
-        return response_error("Invalid case ID")
-
     group_id = data.get('group_id')
     access_level = data.get('access_level')
 
@@ -317,10 +321,6 @@ def group_cac_set_case(caseid):
         return response_error(msg=str(e))
 
     if success:
-        track_activity("case access set to {} for group {}".format(data.get('access_level'), group_id), caseid)
-        add_obj_history_entry(case, "access changed to {} for group {}".format(data.get('access_level'), group_id),
-                              commit=True)
-
         return response_success(msg=logs)
 
     return response_error(msg=logs)
@@ -344,16 +344,9 @@ def user_cac_set_case(caseid):
     if data.get('case_id') != caseid:
         return response_error("Inconsistent case ID")
 
-    case = get_case(caseid)
-    if not case:
-        return response_error('Invalid case ID')
-
     try:
 
         success, logs = set_user_case_access(user.id, data.get('case_id'), data.get('access_level'))
-        track_activity("case access set to {} for user {}".format(data.get('access_level'), user.name), caseid)
-        add_obj_history_entry(case, "access changed to {} for user {}".format(data.get('access_level'), user.name))
-
         db.session.commit()
 
     except Exception as e:
@@ -382,68 +375,14 @@ def case_update_status(caseid):
         status = int(status)
     except ValueError:
         return response_error('Invalid status')
-    except TypeError:
-        return response_error('Invalid status. Expected int')
 
     if status not in case_status:
         return response_error('Invalid status')
 
     case.status_id = status
-    add_obj_history_entry(case, f'status updated to {CaseStatus(status).name}')
-
     db.session.commit()
 
     return response_success("Case status updated", data=case.status_id)
 
 
-@case_blueprint.route('/case/md-helper', methods=['GET'])
-@ac_case_requires(CaseAccessLevel.read_only, CaseAccessLevel.full_access)
-def case_md_helper(caseid, url_redir):
 
-    return render_template('case_md_helper.html')
-
-
-@case_blueprint.route('/case/review/update', methods=['POST'])
-@ac_api_case_requires(CaseAccessLevel.full_access)
-def case_review(caseid):
-
-    case = get_case(caseid)
-    if not case:
-        return response_error('Invalid case ID')
-
-    action = request.get_json().get('action')
-    reviewer_id = request.get_json().get('reviewer_id')
-
-    if action == 'start':
-        review_name = ReviewStatusList.review_in_progress
-    elif action == 'cancel' or action == 'request':
-        review_name = ReviewStatusList.pending_review
-    elif action == 'no_review':
-        review_name = ReviewStatusList.no_review_required
-    elif action == 'to_review':
-        review_name = ReviewStatusList.not_reviewed
-    elif action == 'done':
-        review_name = ReviewStatusList.reviewed
-    else:
-        return response_error('Invalid action')
-
-    case.review_status_id = get_review_id_from_name(review_name)
-    if reviewer_id:
-        try:
-            reviewer_id = int(reviewer_id)
-        except ValueError:
-            return response_error('Invalid reviewer ID')
-
-        if not ac_fast_check_user_has_case_access(reviewer_id, caseid, [CaseAccessLevel.full_access]):
-            return response_error('Invalid reviewer ID')
-
-        case.reviewer_id = reviewer_id
-
-    db.session.commit()
-
-    add_obj_history_entry(case, f'review status updated to {review_name}')
-    track_activity(f'review status updated to {review_name}', caseid)
-
-    db.session.commit()
-
-    return response_success("Case review updated", data=CaseSchema().dump(case))
