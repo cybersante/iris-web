@@ -5,6 +5,7 @@ function load_qualif_data(){
     /* Loads qualif data and inserts it
     in corresponding div
     */
+    data = {}
     post_request_api('/case/qualif/get', JSON.stringify(data), true)
     .done((data) => {
         qualif_info = data.data["qualifinfo"];
